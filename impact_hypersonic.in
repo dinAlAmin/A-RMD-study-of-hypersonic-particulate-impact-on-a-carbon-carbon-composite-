@@ -1,0 +1,211 @@
+#######################################################################################
+# This input file is for the simulation of hypersonic impact. The things are in consi-#
+# derations:                                                                          #
+#	1. Particle (water, ice, dust etc) passes through shock zone initially        #
+#	2. Particle gets deformed due to high temperature in shock zone and then      #
+#	   impact occurs.                                                             #
+#	3. Throughout the initial run, the stationary shock zone is kept at its place #
+#	   by reflective walls. Just before the particle leaving the shock zone, we   #
+#   	   need to remove the reflective wall so that shock zone's air particles do   #
+# 	   not deposited at the bottom of the reflective wall. 	                      #
+#######################################################################################
+
+units		real
+atom_style	full
+dimension	3
+boundary	p p f
+
+read_data	LAMMPS_DATA_FILE
+
+#######################################################################################
+# Regions:                                                                            #
+#	1. Bottom layer of the C-C composite as rigid layer so that it doesn't move   #
+#	   after impact.                                                              #
+#	2. A thin layer for thermodynamic sink just above the rigid layer             #
+#	3. Rest of the C-C material in NVE                                            #
+#######################################################################################
+
+region		fixed block INF INF INF INF INF -6.0 units box
+region		thermostat block INF INF INF INF -6.0 90.0 units box
+region		nvestate block INF INF INF INF 90.0 118.0 units box
+group		fixed region fixed
+group		thermostat region thermostat
+group		nvestate region nvestate
+
+group           furan type 1 2
+group           SiO type 3 4
+group		air type 5 6
+group		shock type 7 8
+
+######################################################################################
+# 			Setup for ReaxFF forcefield 				     #
+######################################################################################
+
+pair_style	reaxff NULL safezone 3.0 mincap 150
+pair_coeff	* * CHONSi_2020.ff C C Si O N O N O
+neighbor 	2.5 bin
+neigh_modify 	delay 0 every 1 check yes
+fix 		2 all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff
+fix 		3 all balance 500 1.0 shift xyz 20 1.1
+######################################################################################
+#				Initial Setups					     #
+######################################################################################
+
+timestep	0.1
+
+fix 		zwalls all wall/reflect zlo EDGE zhi EDGE
+fix		shockcontainer shock wall/reflect zlo 128.0 zhi 600.25
+
+compute 	PROF_CHUNK all chunk/atom bin/1d z -6.0 10.0 units box bound z -6.0 739.0 compress yes discard yes
+compute		ATOM_STRESS all stress/atom NULL virial
+
+compute         ctSiO SiO temp
+compute_modify  ctSiO dynamic/dof yes
+
+######################################################################################
+# Energy partition analysis							     #
+# The purpose of these computes is not to force an artificial exact split between    #
+# "mechanical" and "chemical" energy.						     #  
+# They provide:                                                                      #
+#   - projectile and target total kinetic energies                                   #
+#   - group-resolved per-atom potential-energy sums                                  #
+#   - the 14 global ReaxFF energy contributions                                      #
+#   - per-atom KE/PE for optional spatial post-processing                            #
+######################################################################################
+
+# Group kinetic energies (kcal/mol in LAMMPS "real" units)
+
+compute         KE_SIO SiO ke
+compute         KE_TARGET furan ke
+
+# Per-atom energies
+
+compute         KEATOM all ke/atom
+compute         PEATOM all pe/atom
+compute         PE_SIO SiO reduce sum c_PEATOM
+compute         PE_TARGET furan reduce sum c_PEATOM
+
+# Global ReaxFF energy decomposition
+# pair_style reaxff provides 14 energy terms through compute pair reaxff
+
+compute         REAX_ENERGY all pair reaxff
+
+variable        E_bond      equal c_REAX_ENERGY[1]
+variable        E_atom      equal c_REAX_ENERGY[2]
+variable        E_lp        equal c_REAX_ENERGY[3]
+variable        E_mol       equal c_REAX_ENERGY[4]
+variable        E_val       equal c_REAX_ENERGY[5]
+variable        E_pen       equal c_REAX_ENERGY[6]
+variable        E_coa       equal c_REAX_ENERGY[7]
+variable        E_hbond     equal c_REAX_ENERGY[8]
+variable        E_torsion   equal c_REAX_ENERGY[9]
+variable        E_conj      equal c_REAX_ENERGY[10]
+variable        E_vdw       equal c_REAX_ENERGY[11]
+variable        E_coul      equal c_REAX_ENERGY[12]
+variable        E_field     equal c_REAX_ENERGY[13]
+variable        E_qeq       equal c_REAX_ENERGY[14]
+
+# Simulation time and projectile COM velocities 
+
+variable        SimTime     equal time
+variable        VCMx_SIO    equal vcm(SiO,x)
+variable        VCMy_SIO    equal vcm(SiO,y)
+variable        VCMz_SIO    equal vcm(SiO,z)
+
+# Whole-system energies for checking overall energy balance
+
+variable        PE_ALL      equal pe
+variable        KE_ALL      equal ke
+variable        ETOT_ALL    equal etotal
+
+# Output files and fixes
+
+fix		SHOCK_PROFILES all ave/chunk 10 10 1000 PROF_CHUNK density/mass vx temp file shock_properties_profile.dat
+fix             CHEM_SPECIES all reaxff/species 1 10 100 species_evolution.txt element C C Si O N O N O cutoff 3 * 0.55
+fix             BOND_INFO all reaxff/bonds 1000 detailed_bonds.dat
+fix		RIGID_BASE fixed setforce 0 0 0
+
+# C-C surface temperature is set using nvt2 fix
+
+fix             nvt2 thermostat nvt temp 2500 2500 10.0
+fix		nve3 air nve
+fix		nve4 shock nve
+
+######################################################################################
+# 				Energy history					     #
+######################################################################################
+
+fix ENERGY_HISTORY all ave/time 1 1 100 &
+    v_SimTime &
+    c_KE_SIO c_KE_TARGET c_PE_SIO c_PE_TARGET &
+    v_E_bond v_E_atom v_E_lp v_E_mol v_E_val v_E_pen v_E_coa &
+    v_E_hbond v_E_torsion v_E_conj v_E_vdw v_E_coul v_E_field v_E_qeq &
+    f_nvt2 v_PE_ALL v_KE_ALL v_ETOT_ALL &
+    file energy_partition.dat &
+    title1 "# Reviewer-2 energy history; LAMMPS real units (energy = kcal/mol)" &
+    title2 "# Step Time_fs KE_SiO KE_Target PE_SiO PE_Target Ebond Eatom Elp Emol Eval Epen Ecoa Ehbond Etorsion Econj Evdw Ecoul Efield Eqeq ThermostatExchange PE_All KE_All Etot_All"
+
+########################################################################################
+#					Outputs					       #
+########################################################################################
+
+thermo 		500
+thermo_style 	custom step time density temp press pe ke etotal &
+                c_KE_SIO c_KE_TARGET c_PE_SIO c_PE_TARGET &
+                v_E_bond v_E_conj v_E_coul f_nvt2
+
+dump            1 all custom 500 dump.addwater &
+                id type mass x y z vx vy vz q &
+                c_KEATOM c_PEATOM &
+                c_ATOM_STRESS[1] c_ATOM_STRESS[2] c_ATOM_STRESS[3] &
+                c_ATOM_STRESS[4] c_ATOM_STRESS[5] c_ATOM_STRESS[6]
+
+dump            ENERGY_SIO SiO custom 100 projectile_energy.dump &
+                id type mass x y z vx vy vz c_KEATOM c_PEATOM
+
+########################################################################################
+# Main dynamic runs are divided into two parts:                                        #
+#	1. Run until the particle reaches the end of shock zone			       #
+#	2. After reaching the end of shock zone, shock container walls are removed &   #
+#	   continue runs.                                                              #
+########################################################################################
+
+# Velocity is set based on Mach Number
+
+velocity 	SiO create Initial_temp Seed_number rot yes dist gaussian
+velocity 	SiO set NULL NULL -0.04116 temp ctSiO
+fix		nve SiO nve 
+fix		nve2 nvestate nve
+
+########################################################################################
+# Computing positions of shock zone and particles to setup a condition check.          #
+########################################################################################
+
+compute		x_sio SiO reduce max x
+compute		x_shk shock reduce max x
+
+variable	x_sio equal c_x_sio
+variable	x_shk_temp equal c_x_shk
+variable	x_shk equal "v_x_shk_temp - 10"
+
+########################################################################################
+# Calls a loop and check condition if the particle passes the shock zone.              #
+########################################################################################
+restart		10000 restart.*.impact
+label		conditional_loop
+
+# 'run 0' has to perform for calculation to occur
+run		0
+
+if "${x_sio} > ${x_shk}" then &
+	"jump SELF break_loop"
+
+print		"Position of particle: ${x_sio} <= Shock zone: ${x_shk}"
+run		5000
+
+jump		SELF conditional_loop
+
+label		break_loop
+
+unfix		shockcontainer
+run		250000
